@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <stddef.h>
 #include <getopt.h>
+#include <time.h>
 
 #define MAX_ROUTES 100
 #define MAX_CLIENTS 64
@@ -33,7 +34,20 @@ int debug_enabled = 0;
 uid_t auth_uid = 0;
 int auth_uid_set = 0;
 
-#define DBG(...) do { if (debug_enabled) printf(__VA_ARGS__); } while(0)
+static void print_log_timestamp(FILE *stream) {
+    struct timespec now;
+    struct tm local_time;
+    char time_string[9];
+
+    clock_gettime(CLOCK_REALTIME, &now);
+    localtime_r(&now.tv_sec, &local_time);
+    strftime(time_string, sizeof(time_string), "%H:%M:%S", &local_time);
+    fprintf(stream, "[%s.%03ld] ", time_string, now.tv_nsec / 1000000L);
+}
+
+#define LOG(stream, ...) do { print_log_timestamp(stream); fprintf(stream, __VA_ARGS__); } while(0)
+#define DBG(...) do { if (debug_enabled) LOG(stdout, __VA_ARGS__); } while(0)
+#define ERR(...) LOG(stderr, __VA_ARGS__)
 
 // ---------- Struttura per trasportare FD ancillary ----------
 
@@ -156,7 +170,7 @@ static int authenticate_to_bus(int fd, uid_t uid, int uid_set) {
     char resp[256];
     if (recv_line(fd, resp, sizeof(resp)) < 0) return -1;
     if (strncmp(resp, "OK ", 3) != 0) {
-        fprintf(stderr, "[-] Auth fallita: %s\n", resp);
+        ERR("[-] Auth fallita: %s\n", resp);
         return -1;
     }
     
@@ -280,7 +294,7 @@ static int read_dbus_message(int fd, uint8_t *buf, int bufsize, AncillaryFds *af
     
     DBusRawHeader *hdr = (DBusRawHeader *)buf;
     if (hdr->endian != 'l' && hdr->endian != 'B') {
-        fprintf(stderr, "[-] Endian non valido: 0x%02x\n", hdr->endian);
+        ERR("[-] Endian non valido: 0x%02x\n", hdr->endian);
         return -1;
     }
     
@@ -289,7 +303,7 @@ static int read_dbus_message(int fd, uint8_t *buf, int bufsize, AncillaryFds *af
     uint32_t total_len = align8(12 + 4 + fields_len) + body_len;
     
     if ((int)total_len > bufsize) {
-        fprintf(stderr, "[-] Messaggio troppo grande: %u\n", total_len);
+        ERR("[-] Messaggio troppo grande: %u\n", total_len);
         return -1;
     }
     
@@ -932,7 +946,7 @@ static void* handle_client(void *arg) {
         const char *path = (i < route_count) ? routes[i].socket_path : default_socket_path;
         bus_fds[i] = connect_unix(path);
         if (bus_fds[i] < 0) {
-            fprintf(stderr, "[-] Connessione a %s fallita: %s\n", path, strerror(errno));
+            ERR("[-] Connessione a %s fallita: %s\n", path, strerror(errno));
             goto cleanup;
         }
         uid_t uid;
@@ -945,13 +959,13 @@ static void* handle_client(void *arg) {
             uid_set = default_uid_set;
         }
         if (authenticate_to_bus(bus_fds[i], uid, uid_set) < 0) {
-            fprintf(stderr, "[-] Autenticazione verso %s fallita\n", path);
+            ERR("[-] Autenticazione verso %s fallita\n", path);
             goto cleanup;
         }
         uint32_t ser;
         bus_names[i] = send_hello(bus_fds[i], &ser);
         if (!bus_names[i]) {
-            fprintf(stderr, "[-] Hello verso %s fallita\n", path);
+            ERR("[-] Hello verso %s fallita\n", path);
             goto cleanup;
         }
         bus_serials[i] = ser + 1;
@@ -1267,12 +1281,12 @@ int main(int argc, char *argv[]) {
                 break;
             case 'r':
                 if (route_count >= MAX_ROUTES) {
-                    fprintf(stderr, "[-] Troppe rotte\n");
+                    ERR("[-] Troppe rotte\n");
                     return EXIT_FAILURE;
                 }
                 char *sep = strchr(optarg, ':');
                 if (!sep) {
-                    fprintf(stderr, "[-] Formato rotta non valido: %s (atteso DEST:PATH[@UID])\n", optarg);
+                    ERR("[-] Formato rotta non valido: %s (atteso DEST:PATH[@UID])\n", optarg);
                     return EXIT_FAILURE;
                 }
                 routes[route_count].destination = strndup(optarg, sep - optarg);
@@ -1293,7 +1307,7 @@ int main(int argc, char *argv[]) {
     }
     
     if (!listen_socket_path || !default_socket_path) {
-        fprintf(stderr, "[-] Parametri -l e -s obbligatori\n\n");
+        ERR("[-] Parametri -l e -s obbligatori\n\n");
         usage(argv[0]);
         return EXIT_FAILURE;
     }
@@ -1301,7 +1315,7 @@ int main(int argc, char *argv[]) {
     unlink(listen_socket_path);
     
     int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (server_fd < 0) { perror("socket"); return EXIT_FAILURE; }
+    if (server_fd < 0) { ERR("socket: %s\n", strerror(errno)); return EXIT_FAILURE; }
     
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -1309,16 +1323,16 @@ int main(int argc, char *argv[]) {
     strncpy(addr.sun_path, listen_socket_path, sizeof(addr.sun_path) - 1);
     
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind"); return EXIT_FAILURE;
+        ERR("bind: %s\n", strerror(errno)); return EXIT_FAILURE;
     }
     if (listen(server_fd, 16) < 0) {
-        perror("listen"); return EXIT_FAILURE;
+        ERR("listen: %s\n", strerror(errno)); return EXIT_FAILURE;
     }
     
-    printf("[*] DBus Proxy in ascolto su: %s\n", listen_socket_path);
-    printf("[*] Bus sessione: %s\n", default_socket_path);
+    LOG(stdout, "[*] DBus Proxy in ascolto su: %s\n", listen_socket_path);
+    LOG(stdout, "[*] Bus sessione: %s\n", default_socket_path);
     for (int i = 0; i < route_count; i++) {
-        printf("[*] Rotta: %s -> %s\n", routes[i].destination, routes[i].socket_path);
+        LOG(stdout, "[*] Rotta: %s -> %s\n", routes[i].destination, routes[i].socket_path);
     }
        
     while (1) {
