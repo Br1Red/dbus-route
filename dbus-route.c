@@ -821,16 +821,25 @@ static void readbuf_init(ReadBuffer *rb) {
 }
 
 static int readbuf_fill(ReadBuffer *rb, int fd) {
-    if (rb->len >= BUF_SIZE * 2) return -1;
+    if (rb->len >= BUF_SIZE * 2) {
+        errno = EMSGSIZE;
+        return -1;
+    }
 
     size_t read_len;
     if (rb->len < 16) {
         read_len = 16 - rb->len;
     } else {
         DBusRawHeader *hdr = (DBusRawHeader *)rb->data;
-        if (hdr->endian != 'l' && hdr->endian != 'B') return -1;
+        if (hdr->endian != 'l' && hdr->endian != 'B') {
+            errno = EPROTO;
+            return -1;
+        }
         uint32_t msglen = align8(16 + hdr->header_fields_length) + hdr->body_length;
-        if (msglen < 16 || msglen > BUF_SIZE * 2 || rb->len >= (int)msglen) return -1;
+        if (msglen < 16 || msglen > BUF_SIZE * 2 || rb->len >= (int)msglen) {
+            errno = EMSGSIZE;
+            return -1;
+        }
         read_len = msglen - rb->len;
     }
     
@@ -1012,7 +1021,7 @@ static void* handle_client(void *arg) {
     
     epfd = epoll_create1(0);
     struct epoll_event ev;
-    ev.events = EPOLLIN;
+    ev.events = EPOLLIN | EPOLLRDHUP;
     ev.data.fd = client_fd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev);
     
@@ -1184,8 +1193,16 @@ static void* handle_client(void *arg) {
         for (int e = 0; e < nev; e++) {
             int fd = events[e].data.fd;
             
-            if (events[e].events & (EPOLLERR | EPOLLHUP)) {
-                DBG("[-] Errore/hangup su fd=%d\n", fd);
+            if (events[e].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+                int socket_error = 0;
+                socklen_t error_len = sizeof(socket_error);
+                const char *endpoint = fd == client_fd ? "client" : "bus";
+
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_len) < 0)
+                    socket_error = errno;
+                DBG("[-] Hangup su %s fd=%d events=0x%x: %s\n",
+                    endpoint, fd, events[e].events,
+                    socket_error ? strerror(socket_error) : "peer chiuso");
                 goto cleanup;
             }
             
@@ -1202,9 +1219,17 @@ static void* handle_client(void *arg) {
             }
             if (!rb) continue;
             
-            if (readbuf_fill(rb, fd) < 0) {
-                DBG("[-] %s disconnesso (fd=%d)\n",
-                    fd == client_fd ? "Client" : "Bus", fd);
+            int read_result = readbuf_fill(rb, fd);
+            if (read_result <= 0) {
+                int read_error = errno;
+                const char *endpoint = fd == client_fd ? "Client" : "Bus";
+
+                if (read_result == 0) {
+                    DBG("[-] %s ha chiuso la connessione (EOF, fd=%d)\n", endpoint, fd);
+                } else {
+                    DBG("[-] Lettura da %s fallita (fd=%d): %s\n",
+                        endpoint, fd, strerror(read_error));
+                }
                 goto cleanup;
             }
         }
