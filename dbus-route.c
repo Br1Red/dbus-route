@@ -14,6 +14,7 @@
 #define MAX_ROUTES 100
 #define MAX_CLIENTS 64
 #define BUF_SIZE 65536
+#define DBUS_MAX_MESSAGE_SIZE (1U << 27)
 #define MAX_PENDING 8192
 #define MAX_FDS 16
 
@@ -272,6 +273,19 @@ typedef struct {
 
 static inline uint32_t align8(uint32_t v) { return (v + 7) & ~7; }
 static inline uint32_t align4(uint32_t v) { return (v + 3) & ~3; }
+
+static int dbus_message_length(const DBusRawHeader *hdr, size_t *length) {
+    uint64_t header_len = ((uint64_t)16 + hdr->header_fields_length + 7) & ~UINT64_C(7);
+    uint64_t total_len = header_len + hdr->body_length;
+
+    if (total_len < 16 || total_len > DBUS_MAX_MESSAGE_SIZE) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+
+    *length = (size_t)total_len;
+    return 0;
+}
 
 // Legge un messaggio DBus completo, catturando eventuali fd ancillary
 static int read_dbus_message(int fd, uint8_t *buf, int bufsize, AncillaryFds *afds) {
@@ -809,23 +823,33 @@ static void close_ancillary_fds(AncillaryFds *afds) {
 // ---------- Buffer di lettura per-connessione ----------
 
 typedef struct {
-    uint8_t data[BUF_SIZE * 2];
-    int len;
+    uint8_t *data;
+    size_t len;
+    size_t capacity;
     AncillaryFds pending_fds[32];
     int pending_fds_count;
 } ReadBuffer;
 
-static void readbuf_init(ReadBuffer *rb) {
+static int readbuf_init(ReadBuffer *rb) {
+    rb->data = malloc(16);
+    if (!rb->data) return -1;
     rb->len = 0;
+    rb->capacity = 16;
     rb->pending_fds_count = 0;
+    return 0;
+}
+
+static int readbuf_reserve(ReadBuffer *rb, size_t capacity) {
+    if (capacity <= rb->capacity) return 0;
+
+    uint8_t *data = realloc(rb->data, capacity);
+    if (!data) return -1;
+    rb->data = data;
+    rb->capacity = capacity;
+    return 0;
 }
 
 static int readbuf_fill(ReadBuffer *rb, int fd) {
-    if (rb->len >= BUF_SIZE * 2) {
-        errno = EMSGSIZE;
-        return -1;
-    }
-
     size_t read_len;
     if (rb->len < 16) {
         read_len = 16 - rb->len;
@@ -835,11 +859,13 @@ static int readbuf_fill(ReadBuffer *rb, int fd) {
             errno = EPROTO;
             return -1;
         }
-        uint32_t msglen = align8(16 + hdr->header_fields_length) + hdr->body_length;
-        if (msglen < 16 || msglen > BUF_SIZE * 2 || rb->len >= (int)msglen) {
+        size_t msglen;
+        if (dbus_message_length(hdr, &msglen) < 0) return -1;
+        if (rb->len >= msglen) {
             errno = EMSGSIZE;
             return -1;
         }
+        if (readbuf_reserve(rb, msglen) < 0) return -1;
         read_len = msglen - rb->len;
     }
     
@@ -863,21 +889,28 @@ static int readbuf_has_message(ReadBuffer *rb) {
     DBusRawHeader *hdr = (DBusRawHeader *)rb->data;
     if (hdr->endian != 'l' && hdr->endian != 'B') return -1;
     
-    uint32_t total_len = align8(12 + 4 + hdr->header_fields_length) + hdr->body_length;
-    return (rb->len >= (int)total_len) ? (int)total_len : 0;
+    size_t total_len;
+    if (dbus_message_length(hdr, &total_len) < 0) return -1;
+    return (rb->len >= total_len) ? (int)total_len : 0;
 }
 
-static int readbuf_extract(ReadBuffer *rb, uint8_t *out, int outsize, AncillaryFds *afds) {
+static int readbuf_extract(ReadBuffer *rb, uint8_t **out, size_t *outsize, AncillaryFds *afds) {
     if (afds) { afds->num_fds = 0; }
     
     int msglen = readbuf_has_message(rb);
     if (msglen <= 0) return msglen;
-    if (msglen > outsize) return -1;
+    size_t required = (size_t)msglen + BUF_SIZE;
+    if (required > *outsize) {
+        uint8_t *new_out = realloc(*out, required);
+        if (!new_out) return -1;
+        *out = new_out;
+        *outsize = required;
+    }
     
-    memcpy(out, rb->data, msglen);
+    memcpy(*out, rb->data, msglen);
     
     MsgFields mf;
-    extract_msg_fields(out, msglen, &mf);
+    extract_msg_fields(*out, msglen, &mf);
     if (afds && mf.has_unix_fds && mf.unix_fds > 0 && rb->pending_fds_count > 0) {
         *afds = rb->pending_fds[0];
         for (int i = 1; i < rb->pending_fds_count; i++) {
@@ -886,7 +919,7 @@ static int readbuf_extract(ReadBuffer *rb, uint8_t *out, int outsize, AncillaryF
         rb->pending_fds_count--;
     }
     
-    int remaining = rb->len - msglen;
+    size_t remaining = rb->len - msglen;
     if (remaining > 0) {
         memmove(rb->data, rb->data + msglen, remaining);
     }
@@ -945,6 +978,8 @@ static void* handle_client(void *arg) {
     char **bus_names = calloc(num_buses, sizeof(char *));
     uint32_t *bus_serials = calloc(num_buses, sizeof(uint32_t));
     ReadBuffer *read_bufs = NULL;
+    uint8_t *buf = NULL;
+    size_t bufsize = 0;
     int epfd = -1;
     
     for (int i = 0; i < num_buses; i++) {
@@ -1000,7 +1035,7 @@ static void* handle_client(void *arg) {
     int total_fds = 1 + num_buses;
     read_bufs = calloc(total_fds, sizeof(ReadBuffer));
     for (int i = 0; i < total_fds; i++) {
-        readbuf_init(&read_bufs[i]);
+        if (readbuf_init(&read_bufs[i]) < 0) goto cleanup;
     }
     
     struct {
@@ -1030,7 +1065,6 @@ static void* handle_client(void *arg) {
         epoll_ctl(epfd, EPOLL_CTL_ADD, bus_fds[i], &ev);
     }
     
-    uint8_t buf[BUF_SIZE];
     struct epoll_event events[MAX_CLIENTS];
     
     while (1) {
@@ -1042,7 +1076,7 @@ static void* handle_client(void *arg) {
                 ReadBuffer *rb = &read_bufs[0];
                 AncillaryFds afds = {0};
                 int msglen;
-                while ((msglen = readbuf_extract(rb, buf, BUF_SIZE, &afds)) > 0) {
+                while ((msglen = readbuf_extract(rb, &buf, &bufsize, &afds)) > 0) {
                     processed_buffered = 1;
                     MsgFields mf;
                     extract_msg_fields(buf, msglen, &mf);
@@ -1070,7 +1104,7 @@ static void* handle_client(void *arg) {
                     set_serial(buf, new_serial);
                     
                     if (mf.has_sender) {
-                        msglen = remove_header_field(buf, msglen, BUF_SIZE, DBUS_HEADER_FIELD_SENDER);
+                        msglen = remove_header_field(buf, msglen, (int)bufsize, DBUS_HEADER_FIELD_SENDER);
                         if (msglen < 0) { close_ancillary_fds(&afds); goto cleanup; }
                     }
                     
@@ -1117,7 +1151,7 @@ static void* handle_client(void *arg) {
                 ReadBuffer *rb = &read_bufs[1 + bi];
                 AncillaryFds afds = {0};
                 int msglen;
-                while ((msglen = readbuf_extract(rb, buf, BUF_SIZE, &afds)) > 0) {
+                while ((msglen = readbuf_extract(rb, &buf, &bufsize, &afds)) > 0) {
                     processed_buffered = 1;
                     uint8_t msg_type = buf[1];
                     MsgFields mf;
@@ -1150,7 +1184,7 @@ static void* handle_client(void *arg) {
                     if (mf.destination && bus_names[bi]) {
                         if (mf.destination_len == strlen(bus_names[bi]) &&
                             memcmp(mf.destination, bus_names[bi], mf.destination_len) == 0) {
-                            msglen = replace_header_string_field(buf, msglen, BUF_SIZE,
+                            msglen = replace_header_string_field(buf, msglen, (int)bufsize,
                                 DBUS_HEADER_FIELD_DESTINATION, client_unique_name);
                             if (msglen < 0) { close_ancillary_fds(&afds); goto cleanup; }
                         }
@@ -1248,9 +1282,11 @@ cleanup:
             for (int j = 0; j < read_bufs[i].pending_fds_count; j++) {
                 close_ancillary_fds(&read_bufs[i].pending_fds[j]);
             }
+            free(read_bufs[i].data);
         }
         free(read_bufs);
     }
+    free(buf);
     free(bus_fds);
     free(bus_names);
     free(bus_serials);

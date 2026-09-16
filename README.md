@@ -41,7 +41,7 @@ The application supports the following route configuration options:
 
 - **Epoll-based I/O**: Scalable event-driven architecture supporting up to 64 concurrent clients
 - **Ancillary FD Support**: Transparent file descriptor passing through the routing layer
-- **Buffer Management**: 64KB per-connection buffers with queuing for pending data
+- **Buffer Management**: Per-connection buffers sized dynamically for each message
 - **Atomic Operations**: Thread-safe route management
 
 ## Limitations
@@ -49,7 +49,7 @@ The application supports the following route configuration options:
 - Maximum 100 routes
 - Maximum 64 concurrent clients
 - Maximum 16 file descriptors per ancillary data message
-- 64KB connection buffer size
+- Maximum D-Bus message size of 128MB
 
 ## License
 
