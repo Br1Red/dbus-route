@@ -969,7 +969,7 @@ static void* handle_client(void *arg) {
     DBG("[+] Nuovo client connesso (fd=%d)\n", client_fd);
     
     if (authenticate_client(client_fd) < 0) {
-        DBG("[-] Autenticazione client fallita\n");
+        ERR("[-] Autenticazione client fallita\n");
         close(client_fd);
         return NULL;
     }
@@ -1263,7 +1263,7 @@ static void* handle_client(void *arg) {
                 if (read_result == 0) {
                     DBG("[-] %s ha chiuso la connessione (EOF, fd=%d)\n", endpoint, fd);
                 } else {
-                    DBG("[-] Lettura da %s fallita (fd=%d): %s\n",
+                    ERR("[-] Lettura da %s fallita (fd=%d): %s\n",
                         endpoint, fd, strerror(read_error));
                 }
                 goto cleanup;
