@@ -1,0 +1,67 @@
+#!/bin/bash
+
+set -u
+
+if [ "$#" -lt 1 ] || [ -z "$1" ]; then
+    printf 'Usage: %s [<user>@]<identity-host>\n' "$0" >&2
+    exit 2
+fi
+
+identity_host=$1
+applications="teams-for-linux outlook-for-linux microsoft-edge"
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+router=${script_dir}/dbus-route
+if [ ! -x "${router}" ]; then
+    router=dbus-route
+fi
+
+cleanup() {
+    trap - SIGINT SIGTERM EXIT
+    [ -n "${proxy_pid}" ] && kill "${proxy_pid}" 2>/dev/null
+    [ -n "${tunnel_pid}" ] && kill "${tunnel_pid}" 2>/dev/null
+    rm -f "${local_socket_path}/identity-bus" "${local_socket_path}/routed-bus"
+    for app in ${applications}; do
+        rm -f "${HOME}/.local/share/applications/${app}.desktop"
+    done
+}
+
+trap cleanup EXIT
+
+local_session_bus=${DBUS_SESSION_BUS_ADDRESS#*=}
+local_socket_path=$(dirname "${local_session_bus}")
+remote_session_bus=$(ssh -q -o StrictHostKeyChecking=no "${identity_host}" echo \${DBUS_SESSION_BUS_ADDRESS#*=})
+remote_uid=$(ssh -q -o StrictHostKeyChecking=no "${identity_host}" id -u)
+
+ssh -q -o StrictHostKeyChecking=no -i ~/.ssh/identity_tunnel \
+    -L "${local_socket_path}/identity-bus:${remote_session_bus}" \
+    -nNT "${identity_host}" &
+tunnel_pid=$!
+i=0
+while [ ! -S "${local_socket_path}/identity-bus" ]; do
+    i=$((i + 1))
+    [ "${i}" -gt 15 ] && exit 1
+    sleep 1
+done
+chown "${USER}" "${local_socket_path}/identity-bus"
+
+"${router}" -l "${local_socket_path}/routed-bus" \
+    -r "com.microsoft.identity.broker1:${local_socket_path}/identity-bus@${remote_uid}" \
+    -s "${local_session_bus}" &
+proxy_pid=$!
+sleep 1
+if [ ! -S "${local_socket_path}/routed-bus" ]; then
+    exit 1
+fi
+
+mkdir -p "${HOME}/.local/share/applications"
+for app in ${applications}; do
+    desktop_file=$(find /usr/share/applications -name "${app}.desktop" | head -n 1)
+    if [ -n "${desktop_file}" ]; then
+        cp "${desktop_file}" "${HOME}/.local/share/applications/"
+        sed -i "s|Exec=.*|Exec=env DBUS_SESSION_BUS_ADDRESS=unix:path=${local_socket_path}/routed-bus PATH=\"${script_dir}/bin:\$PATH\" ${app}|" "${HOME}/.local/share/applications/${app}.desktop"
+    fi
+done
+
+while kill -0 "${tunnel_pid}" 2>/dev/null && kill -0 "${proxy_pid}" 2>/dev/null; do
+    sleep 5
+done

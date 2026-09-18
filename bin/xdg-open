@@ -1,0 +1,7 @@
+#!/bin/bash
+
+if [[ "$1" =~ ^https?:// ]]; then
+    microsoft-edge "$1"
+else
+    /usr/bin/xdg-open "$1"
+fi
